@@ -1,0 +1,28 @@
+{
+  "api_url": {
+    "description": "自行部署的 NeteaseCloudMusicApi 服务地址，例如: http://172.17.0.1:3000",
+    "type": "string",
+    "default": "http://127.0.0.1:3000",
+    "hint": "跨容器请填宿主机网桥地址 172.17.0.1，勿用 localhost"
+  },
+  "quality": {
+    "description": "优先获取的音质 (lossless / exhigh / higher / standard)。会员Cookie已填时可用 lossless",
+    "type": "string",
+    "default": "exhigh"
+  },
+  "search_limit": {
+    "description": "每次搜索时，向用户展示的歌曲选项数量。",
+    "type": "int",
+    "default": 5
+  },
+  "cookie": {
+    "description": "登录网易云网页版后，从浏览器开发者工具复制 Cookie。填入含 MUSIC_U 的整段可解锁会员音质。",
+    "type": "string",
+    "default": ""
+  },
+  "send_card": {
+    "description": "在 QQ(aiocqhttp/NapCat) 平台优先发送可点击跳转的音乐卡片；关闭则发送文字+封面+链接。",
+    "type": "bool",
+    "default": true
+  }
+}
