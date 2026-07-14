@@ -1,7 +1,7 @@
 """
 初念点歌 - Chunian Music Plugin for AstrBot
 - Author: 初念
-- 网易云音源 + QQ 音乐卡片; 支持自定义卡片参数与发卡后撤回中间消息。
+- 网易云音源 + QQ 音乐卡片; card_type 二选一(custom/163); custom 卡片封面/标题/歌手/跳转可自定义(留空用真实); 发卡后撤回中间消息。
 """
 import os
 import re
@@ -34,7 +34,6 @@ def _find_ffmpeg() -> Optional[str]:
 
 
 def _safe_msg_id(event) -> Optional[int]:
-    """尽量取到消息 ID，用于撤回。"""
     try:
         mid = getattr(getattr(event, "message_obj", None), "message_id", None)
         if mid is not None:
@@ -92,12 +91,14 @@ class Main(star.Star):
         self.config.setdefault("quality", "exhigh")
         self.config.setdefault("search_limit", 5)
         self.config.setdefault("cookie", "")
-        # 卡片相关
         self.config.setdefault("send_card", True)
-        self.config.setdefault("card_type", "custom")  # custom 或 163
-        self.config.setdefault("card_title_template", "{title}")
-        self.config.setdefault("card_content_template", "{artist} · {album}")
-        self.config.setdefault("card_url_template", "https://music.163.com/song?id={id}")
+        # 卡片类型: custom(自定义,显示QQ音乐标) 或 163(网易云原生卡片,显示网易云标,需NapCat音卡签名)
+        self.config.setdefault("card_type", "custom")
+        # 以下四项仅对 custom 生效: 留空=用真实值, 填了=用自定义值
+        self.config.setdefault("card_title", "")
+        self.config.setdefault("card_singer", "")
+        self.config.setdefault("card_image", "")
+        self.config.setdefault("card_jump_url", "")
         # 发卡后撤回中间消息
         self.config.setdefault("recall_messages", True)
 
@@ -205,7 +206,6 @@ class Main(star.Star):
 
         list_msg_id = None
         if event.get_platform_name() == "aiocqhttp":
-            # 用原生 API 发送以获取 message_id (便于后续撤回)
             try:
                 client = event.bot
                 gid = event.get_group_id()
@@ -263,7 +263,6 @@ class Main(star.Star):
                 del self.song_cache[cache_key]
 
     async def _recall(self, client, *msg_ids):
-        """尽力撤回若干消息; 无权限/超时等失败静默跳过。"""
         for mid in msg_ids:
             if mid is None:
                 continue
@@ -272,68 +271,60 @@ class Main(star.Star):
             except Exception as e:
                 logger.warning(f"初念点歌: 撤回消息 {mid} 失败(可能无管理员权限): {e!s}")
 
+    def _build_custom_card(self, song_id, title, artists, album, cover, audio_url):
+        """构造 custom 音乐卡片段。四个可自定义项留空则用真实值。"""
+        c_title = self.config.get("card_title", "") or title
+        c_singer = self.config.get("card_singer", "") or artists
+        c_image = self.config.get("card_image", "") or cover
+        c_url = self.config.get("card_jump_url", "") or f"https://music.163.com/song?id={song_id}"
+        return {
+            "type": "music",
+            "data": {
+                "type": "custom",
+                "url": c_url,       # 点击跳转(默认真实网易云地址)
+                "audio": audio_url, # 音频直链
+                "title": c_title,   # 标题
+                "image": c_image,   # 封面(NapCat 字段名为 image)
+                "singer": c_singer, # 歌手/副标题(NapCat 字段名为 singer)
+            },
+        }
+
+    async def _send_card_segment(self, event, seg):
+        client = event.bot
+        gid = event.get_group_id()
+        if gid:
+            await client.call_action("send_group_msg", group_id=int(gid), message=[seg])
+        else:
+            await client.call_action("send_private_msg", user_id=int(event.get_sender_id()), message=[seg])
+
     async def _send_song_messages(self, event, num, song_id, title, artists, album, dur, cover, audio_url,
                                   cmd_msg_id=None, list_msg_id=None, num_msg_id=None):
-        # QQ 平台: 发送音乐卡片
         if self.config.get("send_card", True) and event.get_platform_name() == "aiocqhttp":
+            card_type = self.config.get("card_type", "custom")
             try:
-                client = event.bot
-                gid = event.get_group_id()
-                card_type = self.config.get("card_type", "custom")
-
                 if card_type == "163":
+                    # 网易云原生卡片(显示网易云标, 需 NapCat 音卡签名; 失败则回退 custom)
                     seg = {"type": "music", "data": {"type": "163", "id": str(song_id)}}
                 else:
-                    title_txt = self.config.get("card_title_template", "{title}").format(
-                        title=title, artist=artists, album=album, id=song_id)
-                    content_txt = self.config.get("card_content_template", "{artist} · {album}").format(
-                        title=title, artist=artists, album=album, id=song_id)
-                    jump_url = self.config.get("card_url_template", "https://music.163.com/song?id={id}").format(
-                        title=title, artist=artists, album=album, id=song_id)
-                    seg = {
-                        "type": "music",
-                        "data": {
-                            "type": "custom",
-                            "url": jump_url,
-                            "audio": audio_url,
-                            "title": title_txt,
-                            "content": content_txt,
-                            "image": cover,
-                        },
-                    }
-
-                if gid:
-                    await client.call_action("send_group_msg", group_id=int(gid), message=[seg])
-                else:
-                    await client.call_action("send_private_msg", user_id=int(event.get_sender_id()), message=[seg])
-
-                # 卡片发送成功后, 撤回中间消息, 只留卡片
+                    seg = self._build_custom_card(song_id, title, artists, album, cover, audio_url)
+                await self._send_card_segment(event, seg)
                 if self.config.get("recall_messages", True):
-                    await self._recall(client, cmd_msg_id, list_msg_id, num_msg_id)
+                    await self._recall(event.bot, cmd_msg_id, list_msg_id, num_msg_id)
                 return
             except Exception as e:
-                logger.warning(f"初念点歌: 卡片发送失败({self.config.get('card_type')})，回退。原因: {e!s}")
-                # 163 失败时再尝试 custom 一次
-                if self.config.get("card_type") == "163":
+                logger.warning(f"初念点歌: {card_type} 卡片发送失败，尝试回退。原因: {e!s}")
+                if card_type == "163":
+                    # 163 失败 → 用 custom 再试一次
                     try:
-                        client = event.bot
-                        gid = event.get_group_id()
-                        seg = {"type": "music", "data": {
-                            "type": "custom",
-                            "url": f"https://music.163.com/song?id={song_id}",
-                            "audio": audio_url, "title": title,
-                            "content": f"{artists} · {album}", "image": cover}}
-                        if gid:
-                            await client.call_action("send_group_msg", group_id=int(gid), message=[seg])
-                        else:
-                            await client.call_action("send_private_msg", user_id=int(event.get_sender_id()), message=[seg])
+                        seg = self._build_custom_card(song_id, title, artists, album, cover, audio_url)
+                        await self._send_card_segment(event, seg)
                         if self.config.get("recall_messages", True):
-                            await self._recall(client, cmd_msg_id, list_msg_id, num_msg_id)
+                            await self._recall(event.bot, cmd_msg_id, list_msg_id, num_msg_id)
                         return
                     except Exception as e2:
                         logger.warning(f"初念点歌: custom 兜底也失败: {e2!s}")
 
-        # 回退: 文字 + 封面 + 链接
+        # 最终回退: 文字 + 封面 + 链接
         text = (f"遵命，主人！为您播放第 {num} 首歌曲~\n\n♪ 歌名：{title}\n🎤 歌手：{artists}\n"
                 f"💿 专辑：{album}\n⏳ 时长：{dur}\n✨ 音质：{self.config['quality']}\n\n请主人享用喵~")
         comps = [Plain(text)]
