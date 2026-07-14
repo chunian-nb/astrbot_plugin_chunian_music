@@ -1,11 +1,8 @@
 """
 初念点歌 - Chunian Music Plugin for AstrBot
 - Author: 初念
-- 说明: 结合网易云音源(搜索全 + 支持会员Cookie高音质)与 QQ 原生音乐卡片发送。
-- 基于 NachoCrazy/netease-music-astrbot-plugin 二次开发, 新增 aiocqhttp 自定义音乐卡片能力。
-- aiocqhttp(NapCat/Lagrange) 平台下默认发送可点击跳转的音乐卡片; 其它平台自动回退为文字+封面+链接。
+- 网易云音源 + QQ 音乐卡片; 支持自定义卡片参数与发卡后撤回中间消息。
 """
-
 import os
 import re
 import time
@@ -23,21 +20,10 @@ from astrbot.core.message.message_event_result import MessageChain
 from astrbot.api.message_components import Plain, Image, Record
 
 
-# --- Helpers ---
 def _find_ffmpeg() -> Optional[str]:
-    """Try to locate the ffmpeg executable. Returns the absolute path or None."""
     path = shutil.which("ffmpeg")
     if path:
         return path
-    candidates = [
-        r"C:\ffmpeg\bin\ffmpeg.exe",
-        r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
-        r"C:\Program Files (x86)\ffmpeg\bin\ffmpeg.exe",
-    ]
-    candidates.append(os.path.join(os.getcwd(), "ffmpeg", "bin", "ffmpeg.exe"))
-    for candidate in candidates:
-        if os.path.isfile(candidate):
-            return candidate
     try:
         proc = subprocess.run(["ffmpeg", "-version"], capture_output=True, timeout=5)
         if proc.returncode == 0:
@@ -47,10 +33,18 @@ def _find_ffmpeg() -> Optional[str]:
     return None
 
 
-# --- API Wrapper ---
-class NeteaseMusicAPI:
-    """A wrapper for the NeteaseCloudMusicApi to simplify interactions."""
+def _safe_msg_id(event) -> Optional[int]:
+    """尽量取到消息 ID，用于撤回。"""
+    try:
+        mid = getattr(getattr(event, "message_obj", None), "message_id", None)
+        if mid is not None:
+            return int(mid)
+    except Exception:
+        pass
+    return None
 
+
+class NeteaseMusicAPI:
     def __init__(self, api_url: str, session: aiohttp.ClientSession):
         self.base_url = api_url.rstrip("/")
         self.session = session
@@ -70,7 +64,6 @@ class NeteaseMusicAPI:
             return data["songs"][0] if data.get("songs") else None
 
     async def get_audio_url(self, song_id: int, quality: str, cookie: str = "") -> Optional[str]:
-        """Get the audio stream URL for a song with automatic quality fallback."""
         qualities_to_try = list(dict.fromkeys([quality, "exhigh", "higher", "standard"]))
         for q in qualities_to_try:
             url = f"{self.base_url}/song/url/v1?id={str(song_id)}&level={q}&cookie={cookie}"
@@ -91,10 +84,7 @@ class NeteaseMusicAPI:
         return None
 
 
-# --- Main Plugin Class ---
 class Main(star.Star):
-    """网易云点歌 + QQ 音乐卡片。"""
-
     def __init__(self, context, config: Optional[Dict[str, Any]] = None):
         super().__init__(context)
         self.config = config or {}
@@ -102,8 +92,14 @@ class Main(star.Star):
         self.config.setdefault("quality", "exhigh")
         self.config.setdefault("search_limit", 5)
         self.config.setdefault("cookie", "")
-        # 新增: 是否在 QQ(aiocqhttp) 平台优先发送音乐卡片
+        # 卡片相关
         self.config.setdefault("send_card", True)
+        self.config.setdefault("card_type", "custom")  # custom 或 163
+        self.config.setdefault("card_title_template", "{title}")
+        self.config.setdefault("card_content_template", "{artist} · {album}")
+        self.config.setdefault("card_url_template", "https://music.163.com/song?id={id}")
+        # 发卡后撤回中间消息
+        self.config.setdefault("recall_messages", True)
 
         self.waiting_users: Dict[str, Dict[str, Any]] = {}
         self.song_cache: Dict[str, List[Dict[str, Any]]] = {}
@@ -111,14 +107,13 @@ class Main(star.Star):
         self.api = NeteaseMusicAPI(self.config["api_url"], self.http_session)
 
         self._ffmpeg_path = _find_ffmpeg()
-        if self._ffmpeg_path:
+        if self._ffmpeg_path and self._ffmpeg_path != "ffmpeg":
             ffmpeg_dir = os.path.dirname(self._ffmpeg_path)
-            current_path = os.environ.get("PATH", "")
-            if ffmpeg_dir not in current_path:
-                os.environ["PATH"] = ffmpeg_dir + os.pathsep + current_path
+            cur = os.environ.get("PATH", "")
+            if ffmpeg_dir not in cur:
+                os.environ["PATH"] = ffmpeg_dir + os.pathsep + cur
         self.cleanup_task: Optional[asyncio.Task] = None
 
-    # --- Lifecycle Hooks ---
     async def initialize(self):
         self.cleanup_task = asyncio.create_task(self._periodic_cleanup())
         logger.info("初念点歌: 后台清理任务已启动。")
@@ -137,163 +132,213 @@ class Main(star.Star):
         while True:
             await asyncio.sleep(60)
             now = time.time()
-            expired_sessions = []
-            for session_id, user_session in self.waiting_users.items():
-                if user_session["expire"] < now:
-                    expired_sessions.append((session_id, user_session["key"]))
-            for session_id, cache_key in expired_sessions:
-                if session_id in self.waiting_users:
-                    del self.waiting_users[session_id]
-                if cache_key in self.song_cache:
-                    del self.song_cache[cache_key]
+            expired = []
+            for sid, us in self.waiting_users.items():
+                if us["expire"] < now:
+                    expired.append((sid, us["key"]))
+            for sid, ck in expired:
+                if sid in self.waiting_users:
+                    del self.waiting_users[sid]
+                if ck in self.song_cache:
+                    del self.song_cache[ck]
 
-    # --- Event Handlers ---
+    # --- Handlers ---
     @filter.command("点歌", alias={"music", "听歌", "网易云"})
     async def cmd_handler(self, event: AstrMessageEvent, keyword: str = ""):
         if not keyword.strip():
             await event.send(MessageChain([Plain("主人，请告诉我您想听什么歌喵~ 例如：/点歌 Lemon")]))
             return
         event.stop_event()
-        await self.search_and_show(event, keyword.strip())
+        await self.search_and_show(event, keyword.strip(), _safe_msg_id(event))
 
     @filter.regex(r"(?i)^(来.?一首|播放|听.?听|唱.?一首|来.?首)\s*([^\s].+?)(的歌|的歌曲|的音乐|歌|曲)?$")
     async def natural_language_handler(self, event: AstrMessageEvent):
-        match = re.search(
-            r"(?i)^(来.?一首|播放|听.?听|唱.?一首|来.?首)\s*([^\s].+?)(的歌|的歌曲|的音乐|歌|曲)?$",
-            event.message_str,
-        )
+        match = re.search(r"(?i)^(来.?一首|播放|听.?听|唱.?一首|来.?首)\s*([^\s].+?)(的歌|的歌曲|的音乐|歌|曲)?$", event.message_str)
         if match:
             keyword = match.group(2).strip()
             if keyword:
                 event.stop_event()
-                await self.search_and_show(event, keyword)
+                await self.search_and_show(event, keyword, _safe_msg_id(event))
 
     @filter.regex(r"^\d+$", priority=999)
     async def number_selection_handler(self, event: AstrMessageEvent):
-        session_id = event.get_session_id()
-        if session_id not in self.waiting_users:
+        sid = event.get_session_id()
+        if sid not in self.waiting_users:
             return
-        user_session = self.waiting_users[session_id]
-        if time.time() > user_session["expire"]:
+        us = self.waiting_users[sid]
+        if time.time() > us["expire"]:
             return
         try:
             num = int(event.message_str.strip())
         except ValueError:
             return
-        limit = self.config.get("search_limit", 5)
-        if not (1 <= num <= limit):
+        if not (1 <= num <= self.config.get("search_limit", 5)):
             return
         event.stop_event()
-        del self.waiting_users[session_id]
-        await self.play_selected_song(event, user_session["key"], num)
+        num_msg_id = _safe_msg_id(event)
+        del self.waiting_users[sid]
+        await self.play_selected_song(
+            event, us["key"], num,
+            us.get("cmd_msg_id"), us.get("list_msg_id"), num_msg_id,
+        )
 
-    # --- Core Logic ---
-    async def search_and_show(self, event: AstrMessageEvent, keyword: str):
+    # --- Core ---
+    async def search_and_show(self, event: AstrMessageEvent, keyword: str, cmd_msg_id: Optional[int] = None):
         try:
             songs = await self.api.search_songs(keyword, self.config["search_limit"])
         except Exception as e:
             logger.error(f"初念点歌: 搜索失败 {e!s}")
-            await event.send(MessageChain([Plain("呜喵...和音乐服务器的连接断掉了...主人，请检查一下 API 服务是否正常运行喵？")]))
+            await event.send(MessageChain([Plain("呜喵...和音乐服务器的连接断掉了...请检查 API 服务喵？")]))
             return
         if not songs:
-            await event.send(MessageChain([Plain(f"对不起主人...我没能找到「{keyword}」这首歌喵... T_T")]))
+            await event.send(MessageChain([Plain(f"对不起主人...没能找到「{keyword}」这首歌喵... T_T")]))
             return
-        cache_key = f"{event.get_session_id()}_{int(time.time())}"
-        self.song_cache[cache_key] = songs
-        response_lines = [f"主人，我为您找到了 {len(songs)} 首歌曲喵！请回复数字告诉我您想听哪一首~"]
+        ck = f"{event.get_session_id()}_{int(time.time())}"
+        self.song_cache[ck] = songs
+        lines = [f"主人，我为您找到了 {len(songs)} 首歌曲喵！请回复数字告诉我您想听哪一首~"]
         for i, song in enumerate(songs, 1):
             artists = " / ".join(a["name"] for a in song.get("artists", []))
             album = song.get("album", {}).get("name", "未知专辑")
-            duration_ms = song.get("duration", 0)
-            dur_str = f"{duration_ms//60000}:{(duration_ms%60000)//1000:02d}"
-            response_lines.append(f"{i}. {song['name']} - {artists} 《{album}》 [{dur_str}]")
-        await event.send(MessageChain([Plain("\n".join(response_lines))]))
-        self.waiting_users[event.get_session_id()] = {"key": cache_key, "expire": time.time() + 60}
+            d = song.get("duration", 0)
+            lines.append(f"{i}. {song['name']} - {artists} 《{album}》 [{d//60000}:{(d%60000)//1000:02d}]")
+        list_text = "\n".join(lines)
 
-    async def play_selected_song(self, event: AstrMessageEvent, cache_key: str, num: int):
+        list_msg_id = None
+        if event.get_platform_name() == "aiocqhttp":
+            # 用原生 API 发送以获取 message_id (便于后续撤回)
+            try:
+                client = event.bot
+                gid = event.get_group_id()
+                if gid:
+                    ret = await client.call_action("send_group_msg", group_id=int(gid), message=list_text)
+                else:
+                    ret = await client.call_action("send_private_msg", user_id=int(event.get_sender_id()), message=list_text)
+                if isinstance(ret, dict):
+                    list_msg_id = ret.get("message_id")
+            except Exception as e:
+                logger.warning(f"初念点歌: 列表原生发送失败，改用普通发送。{e!s}")
+                await event.send(MessageChain([Plain(list_text)]))
+        else:
+            await event.send(MessageChain([Plain(list_text)]))
+
+        self.waiting_users[event.get_session_id()] = {
+            "key": ck, "expire": time.time() + 60,
+            "cmd_msg_id": cmd_msg_id, "list_msg_id": list_msg_id,
+        }
+
+    async def play_selected_song(self, event, cache_key, num,
+                                 cmd_msg_id=None, list_msg_id=None, num_msg_id=None):
         if cache_key not in self.song_cache:
-            await event.send(MessageChain([Plain("喵呜~ 主人选择得太久了，搜索结果已经凉掉了哦，请重新点歌吧~")]))
+            await event.send(MessageChain([Plain("喵呜~ 选择太久啦，结果凉掉了，请重新点歌吧~")]))
             return
         songs = self.song_cache[cache_key]
         if not (1 <= num <= len(songs)):
-            await event.send(MessageChain([Plain("主人，您输入的数字不对哦，请选择列表里的歌曲编号喵~")]))
+            await event.send(MessageChain([Plain("数字不对哦，请选择列表里的编号喵~")]))
             return
-        selected_song = songs[num - 1]
-        song_id = selected_song["id"]
+        song = songs[num - 1]
+        song_id = song["id"]
         try:
-            song_details = await self.api.get_song_details(song_id)
-            if not song_details:
-                raise ValueError("无法获取歌曲详细信息。")
+            det = await self.api.get_song_details(song_id)
+            if not det:
+                raise ValueError("无法获取歌曲详细信息")
             audio_url = await self.api.get_audio_url(song_id, self.config["quality"], self.config.get("cookie", ""))
             if not audio_url:
-                await event.send(MessageChain([Plain("喵~ 这首歌可能需要 VIP 或者没有版权，暂时不能为主人播放呢...")]))
+                await event.send(MessageChain([Plain("喵~ 这首可能需要 VIP 或无版权，暂时放不了呢...")]))
                 return
-            title = song_details.get("name", "")
-            artists = " / ".join(a["name"] for a in song_details.get("ar", []))
-            album = song_details.get("al", {}).get("name", "未知专辑")
-            cover_url = song_details.get("al", {}).get("picUrl", "")
-            duration_ms = song_details.get("dt", 0)
-            dur_str = f"{duration_ms//60000}:{(duration_ms%60000)//1000:02d}"
+            title = det.get("name", "")
+            artists = " / ".join(a["name"] for a in det.get("ar", []))
+            album = det.get("al", {}).get("name", "未知专辑")
+            cover = det.get("al", {}).get("picUrl", "")
+            d = det.get("dt", 0)
+            dur = f"{d//60000}:{(d%60000)//1000:02d}"
             await self._send_song_messages(
-                event, num, song_id, title, artists, album, dur_str, cover_url, audio_url
+                event, num, song_id, title, artists, album, dur, cover, audio_url,
+                cmd_msg_id, list_msg_id, num_msg_id,
             )
         except Exception as e:
-            logger.error(f"初念点歌: 播放歌曲 {song_id} 失败 {e!s}")
-            await event.send(MessageChain([Plain("呜...获取歌曲信息的时候失败了喵...")]))
+            logger.error(f"初念点歌: 播放失败 {e!s}")
+            await event.send(MessageChain([Plain("呜...获取歌曲信息失败了喵...")]))
         finally:
             if cache_key in self.song_cache:
                 del self.song_cache[cache_key]
 
-    async def _send_song_messages(
-        self, event: AstrMessageEvent, num: int, song_id: int,
-        title: str, artists: str, album: str, dur_str: str, cover_url: str, audio_url: str,
-    ):
-        """优先在 aiocqhttp(QQ) 平台发送自定义音乐卡片; 失败或其它平台回退为文字+封面+语音/链接。"""
-        # 1) QQ 平台: 尝试发送自定义音乐卡片 (无需签名服务器)
+    async def _recall(self, client, *msg_ids):
+        """尽力撤回若干消息; 无权限/超时等失败静默跳过。"""
+        for mid in msg_ids:
+            if mid is None:
+                continue
+            try:
+                await client.call_action("delete_msg", message_id=int(mid))
+            except Exception as e:
+                logger.warning(f"初念点歌: 撤回消息 {mid} 失败(可能无管理员权限): {e!s}")
+
+    async def _send_song_messages(self, event, num, song_id, title, artists, album, dur, cover, audio_url,
+                                  cmd_msg_id=None, list_msg_id=None, num_msg_id=None):
+        # QQ 平台: 发送音乐卡片
         if self.config.get("send_card", True) and event.get_platform_name() == "aiocqhttp":
             try:
-                jump_url = f"https://music.163.com/song?id={song_id}"
-                card_segment = {
-                    "type": "music",
-                    "data": {
-                        "type": "custom",
-                        "url": jump_url,
-                        "audio": audio_url,
-                        "title": title,
-                        "content": f"{artists} · {album}",
-                        "image": cover_url,
-                    },
-                }
-                client = event.bot  # aiocqhttp CQHttp 实例
-                group_id = event.get_group_id()
-                if group_id:
-                    await client.call_action("send_group_msg", group_id=int(group_id), message=[card_segment])
+                client = event.bot
+                gid = event.get_group_id()
+                card_type = self.config.get("card_type", "custom")
+
+                if card_type == "163":
+                    seg = {"type": "music", "data": {"type": "163", "id": str(song_id)}}
                 else:
-                    await client.call_action("send_private_msg", user_id=int(event.get_sender_id()), message=[card_segment])
+                    title_txt = self.config.get("card_title_template", "{title}").format(
+                        title=title, artist=artists, album=album, id=song_id)
+                    content_txt = self.config.get("card_content_template", "{artist} · {album}").format(
+                        title=title, artist=artists, album=album, id=song_id)
+                    jump_url = self.config.get("card_url_template", "https://music.163.com/song?id={id}").format(
+                        title=title, artist=artists, album=album, id=song_id)
+                    seg = {
+                        "type": "music",
+                        "data": {
+                            "type": "custom",
+                            "url": jump_url,
+                            "audio": audio_url,
+                            "title": title_txt,
+                            "content": content_txt,
+                            "image": cover,
+                        },
+                    }
+
+                if gid:
+                    await client.call_action("send_group_msg", group_id=int(gid), message=[seg])
+                else:
+                    await client.call_action("send_private_msg", user_id=int(event.get_sender_id()), message=[seg])
+
+                # 卡片发送成功后, 撤回中间消息, 只留卡片
+                if self.config.get("recall_messages", True):
+                    await self._recall(client, cmd_msg_id, list_msg_id, num_msg_id)
                 return
             except Exception as e:
-                logger.warning(f"初念点歌: 音乐卡片发送失败，回退为文字+链接。原因: {e!s}")
+                logger.warning(f"初念点歌: 卡片发送失败({self.config.get('card_type')})，回退。原因: {e!s}")
+                # 163 失败时再尝试 custom 一次
+                if self.config.get("card_type") == "163":
+                    try:
+                        client = event.bot
+                        gid = event.get_group_id()
+                        seg = {"type": "music", "data": {
+                            "type": "custom",
+                            "url": f"https://music.163.com/song?id={song_id}",
+                            "audio": audio_url, "title": title,
+                            "content": f"{artists} · {album}", "image": cover}}
+                        if gid:
+                            await client.call_action("send_group_msg", group_id=int(gid), message=[seg])
+                        else:
+                            await client.call_action("send_private_msg", user_id=int(event.get_sender_id()), message=[seg])
+                        if self.config.get("recall_messages", True):
+                            await self._recall(client, cmd_msg_id, list_msg_id, num_msg_id)
+                        return
+                    except Exception as e2:
+                        logger.warning(f"初念点歌: custom 兜底也失败: {e2!s}")
 
-        # 2) 回退方案: 文字信息 + 封面 + 语音/链接
-        detail_text = (
-            f"遵命，主人！为您播放第 {num} 首歌曲~\n\n"
-            f"♪ 歌名：{title}\n"
-            f"🎤 歌手：{artists}\n"
-            f"💿 专辑：{album}\n"
-            f"⏳ 时长：{dur_str}\n"
-            f"✨ 音质：{self.config['quality']}\n\n"
-            f"请主人享用喵~\n"
-        )
-        info_components = [Plain(detail_text)]
-        image_data = await self.api.download_image(cover_url)
-        if image_data:
-            info_components.append(Image.fromBase64(base64.b64encode(image_data).decode()))
-        await event.send(MessageChain(info_components))
-        try:
-            await event.send(MessageChain([Record(file=audio_url)]))
-        except Exception as e:
-            err_msg = str(e)
-            if "ffmpeg" in err_msg.lower() or "not found" in err_msg.lower():
-                await event.send(MessageChain([Plain(f"🔊 点击播放：{audio_url}")]))
-            else:
-                await event.send(MessageChain([Plain(f"🔊 点击播放：{audio_url}")]))
+        # 回退: 文字 + 封面 + 链接
+        text = (f"遵命，主人！为您播放第 {num} 首歌曲~\n\n♪ 歌名：{title}\n🎤 歌手：{artists}\n"
+                f"💿 专辑：{album}\n⏳ 时长：{dur}\n✨ 音质：{self.config['quality']}\n\n请主人享用喵~")
+        comps = [Plain(text)]
+        img = await self.api.download_image(cover)
+        if img:
+            comps.append(Image.fromBase64(base64.b64encode(img).decode()))
+        await event.send(MessageChain(comps))
+        await event.send(MessageChain([Plain(f"🔊 点击播放：{audio_url}")]))

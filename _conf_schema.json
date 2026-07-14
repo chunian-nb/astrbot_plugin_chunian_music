@@ -2,26 +2,50 @@
   "api_url": {
     "description": "自行部署的 NeteaseCloudMusicApi 服务地址，例如: http://172.17.0.1:3000",
     "type": "string",
-    "default": "http://127.0.0.1:3000",
-    "hint": "跨容器请填宿主机网桥地址 172.17.0.1，勿用 localhost"
+    "default": "http://127.0.0.1:3000"
   },
   "quality": {
-    "description": "优先获取的音质 (lossless / exhigh / higher / standard)。会员Cookie已填时可用 lossless",
+    "description": "优先获取的音质 (lossless / exhigh / higher / standard)",
     "type": "string",
     "default": "exhigh"
   },
   "search_limit": {
-    "description": "每次搜索时，向用户展示的歌曲选项数量。",
+    "description": "每次搜索时向用户展示的歌曲选项数量",
     "type": "int",
     "default": 5
   },
   "cookie": {
-    "description": "登录网易云网页版后，从浏览器开发者工具复制 Cookie。填入含 MUSIC_U 的整段可解锁会员音质。",
+    "description": "网易云 Cookie(含 MUSIC_U)，解锁会员音质",
     "type": "string",
     "default": ""
   },
   "send_card": {
-    "description": "在 QQ(aiocqhttp/NapCat) 平台优先发送可点击跳转的音乐卡片；关闭则发送文字+封面+链接。",
+    "description": "QQ(aiocqhttp)平台是否优先发送音乐卡片",
+    "type": "bool",
+    "default": true
+  },
+  "card_type": {
+    "description": "卡片类型: custom=自定义卡片(稳定,来源标显示QQ音乐); 163=网易云原生卡片(显示网易云可内联播放,需NapCat音乐支持,失败自动回退custom)",
+    "type": "string",
+    "default": "custom"
+  },
+  "card_title_template": {
+    "description": "自定义卡片标题模板。可用变量: {title} {artist} {album} {id}",
+    "type": "string",
+    "default": "{title}"
+  },
+  "card_content_template": {
+    "description": "自定义卡片副标题模板。可用变量: {title} {artist} {album} {id}",
+    "type": "string",
+    "default": "{artist} · {album}"
+  },
+  "card_url_template": {
+    "description": "自定义卡片点击跳转地址模板。可用变量: {id} {title} {artist} {album}",
+    "type": "string",
+    "default": "https://music.163.com/song?id={id}"
+  },
+  "recall_messages": {
+    "description": "发出音乐卡片后，撤回用户的点歌指令、歌曲列表、选择数字，只保留卡片(撤回用户消息需机器人为群管理员，无权限则自动跳过)",
     "type": "bool",
     "default": true
   }
