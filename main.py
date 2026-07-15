@@ -307,10 +307,25 @@ class Main(star.Star):
         if self.config.get("result_as_image", True) and self._font_path and os.path.isfile(self._font_path):
             try:
                 png = await self._render_result_image(songs)
-                await event.send(MessageChain([Image.fromBytes(png)]))
+                img_msg_id = None
+                # aiocqhttp 用原生API发图以获取 message_id（便于选歌后撤回）
+                if event.get_platform_name() == "aiocqhttp":
+                    import base64 as _b64
+                    b64 = _b64.b64encode(png).decode()
+                    seg = {"type": "image", "data": {"file": f"base64://{b64}"}}
+                    client = event.bot
+                    gid = event.get_group_id()
+                    if gid:
+                        _r = await client.call_action("send_group_msg", group_id=int(gid), message=[seg])
+                    else:
+                        _r = await client.call_action("send_private_msg", user_id=int(event.get_sender_id()), message=[seg])
+                    if isinstance(_r, dict):
+                        img_msg_id = _r.get("message_id")
+                else:
+                    await event.send(MessageChain([Image.fromBytes(png)]))
                 self.waiting_users[event.get_session_id()] = {
                     "key": ck, "expire": time.time() + 60,
-                    "cmd_msg_id": cmd_msg_id, "list_msg_id": None,
+                    "cmd_msg_id": cmd_msg_id, "list_msg_id": img_msg_id,
                 }
                 return
             except Exception as _e:
