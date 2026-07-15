@@ -76,6 +76,22 @@ class NeteaseMusicAPI:
                     return audio_info["url"]
         return None
 
+    async def get_songs_detail(self, ids):
+        """批量获取歌曲详情，返回 {id: picUrl} 映射。"""
+        try:
+            ids_str = ",".join(str(i) for i in ids)
+            url = f"{self.base_url}/song/detail?ids={ids_str}"
+            async with self.session.get(url) as r:
+                r.raise_for_status()
+                data = await r.json()
+                result = {}
+                for song in data.get("songs", []):
+                    pic = (song.get("al", {}) or {}).get("picUrl", "")
+                    result[song.get("id")] = pic
+                return result
+        except Exception:
+            return {}
+
     async def download_image(self, url: str) -> Optional[bytes]:
         if not url:
             return None
@@ -231,12 +247,18 @@ class Main(star.Star):
         d.text((W - pad - tw, 60), "网易云 · 搜索结果", font=f_subh, fill=GRAY)
         d.line([(pad, header_h - 16), (W - pad, header_h - 16)], fill=LINE, width=2)
 
+        try:
+            ids = [s2.get("id") for s2 in songs if s2.get("id")]
+            pic_map = await self.api.get_songs_detail(ids)
+        except Exception:
+            pic_map = {}
+
         y = header_h
         for i, s2 in enumerate(songs):
             mid = y + row_h // 2
             d.text((pad, mid - 22), str(i + 1), font=f_num, fill=RED)
             cx, cs = pad + 56, 76
-            cover_url = s2.get("album", {}).get("picUrl", "") or (s2.get("al", {}) or {}).get("picUrl", "")
+            cover_url = pic_map.get(s2.get("id"), "") or s2.get("album", {}).get("picUrl", "")
             cov = await self._fetch_cover(cover_url, size=cs, radius=10)
             img.paste(cov, (cx, mid - cs // 2), cov)
             artists = " / ".join(a["name"] for a in s2.get("artists", []))
