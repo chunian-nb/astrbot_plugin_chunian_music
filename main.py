@@ -18,6 +18,8 @@ from astrbot.api import star, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.core.message.message_event_result import MessageChain
 from astrbot.api.message_components import Plain, Image, Record
+from PIL import Image as PILImage, ImageDraw, ImageFont
+import io as _io
 
 
 def _find_ffmpeg() -> Optional[str]:
@@ -106,6 +108,11 @@ class Main(star.Star):
         self.song_cache: Dict[str, List[Dict[str, Any]]] = {}
         self.http_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20))
         self.api = NeteaseMusicAPI(self.config["api_url"], self.http_session)
+        # 图片渲染：字体路径（插件目录下）与开关
+        self.config.setdefault("result_as_image", True)
+        self._plugin_dir = os.path.dirname(os.path.abspath(__file__))
+        self._font_path = os.path.join(self._plugin_dir, "DreamHanSans-W17.ttc")
+
 
         self._ffmpeg_path = _find_ffmpeg()
         if self._ffmpeg_path and self._ffmpeg_path != "ffmpeg":
@@ -184,6 +191,76 @@ class Main(star.Star):
         )
 
     # --- Core ---
+
+    async def _fetch_cover(self, url, size=76, radius=10):
+        """下载封面并裁成圆角，返回 PILImage(RGBA)，失败返回灰色占位。"""
+        img = None
+        try:
+            data = await self.api.download_image(url)
+            if data:
+                img = PILImage.open(_io.BytesIO(data)).convert("RGB")
+        except Exception:
+            img = None
+        if img is None:
+            img = PILImage.new("RGB", (size, size), (244, 245, 247))
+        img = img.resize((size, size), PILImage.LANCZOS)
+        mask = PILImage.new("L", (size, size), 0)
+        ImageDraw.Draw(mask).rounded_rectangle([0, 0, size, size], radius=radius, fill=255)
+        out = PILImage.new("RGBA", (size, size), (0, 0, 0, 0))
+        out.paste(img, (0, 0), mask)
+        return out
+
+    async def _render_result_image(self, songs):
+        """把搜索结果渲染成一张白色简洁风格图片，返回 PNG bytes。"""
+        W, pad = 880, 40
+        row_h, header_h, footer_h = 120, 130, 80
+        H = header_h + row_h * len(songs) + footer_h
+        img = PILImage.new("RGB", (W, H), (255, 255, 255))
+        d = ImageDraw.Draw(img)
+        fp = self._font_path
+        f_title = ImageFont.truetype(fp, 44)
+        f_subh = ImageFont.truetype(fp, 24)
+        f_song = ImageFont.truetype(fp, 36)
+        f_meta = ImageFont.truetype(fp, 24)
+        f_num = ImageFont.truetype(fp, 34)
+        f_foot = ImageFont.truetype(fp, 26)
+        INK, GRAY, LINE, RED = (33, 33, 36), (150, 152, 158), (238, 239, 241), (236, 65, 65)
+
+        d.text((pad, 44), "初念点歌", font=f_title, fill=INK)
+        tw = d.textlength("网易云 · 搜索结果", font=f_subh)
+        d.text((W - pad - tw, 60), "网易云 · 搜索结果", font=f_subh, fill=GRAY)
+        d.line([(pad, header_h - 16), (W - pad, header_h - 16)], fill=LINE, width=2)
+
+        y = header_h
+        for i, s2 in enumerate(songs):
+            mid = y + row_h // 2
+            d.text((pad, mid - 22), str(i + 1), font=f_num, fill=RED)
+            cx, cs = pad + 56, 76
+            cover_url = s2.get("album", {}).get("picUrl", "") or (s2.get("al", {}) or {}).get("picUrl", "")
+            cov = await self._fetch_cover(cover_url, size=cs, radius=10)
+            img.paste(cov, (cx, mid - cs // 2), cov)
+            artists = " / ".join(a["name"] for a in s2.get("artists", []))
+            album = s2.get("album", {}).get("name", "未知专辑")
+            dms = s2.get("duration", 0)
+            dur = f"{dms//60000}:{(dms%60000)//1000:02d}"
+            tx = cx + cs + 20
+            title = s2.get("name", "")
+            if len(title) > 18:
+                title = title[:18] + "…"
+            d.text((tx, mid - 34), title, font=f_song, fill=INK)
+            meta = f"{artists} · {album} · {dur}"
+            if len(meta) > 30:
+                meta = meta[:30] + "…"
+            d.text((tx, mid + 6), meta, font=f_meta, fill=GRAY)
+            if i < len(songs) - 1:
+                d.line([(pad, y + row_h), (W - pad, y + row_h)], fill=LINE, width=2)
+            y += row_h
+        d.text((pad, H - 56), "回复数字选择你想听的歌", font=f_foot, fill=GRAY)
+
+        buf = _io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+
     async def search_and_show(self, event: AstrMessageEvent, keyword: str, cmd_msg_id: Optional[int] = None):
         try:
             songs = await self.api.search_songs(keyword, self.config["search_limit"])
@@ -203,6 +280,19 @@ class Main(star.Star):
             d = song.get("duration", 0)
             lines.append(f"{i}. {song['name']} - {artists} 《{album}》 [{d//60000}:{(d%60000)//1000:02d}]")
         list_text = "\n".join(lines)
+
+        # 若开启图片模式，优先渲染图片发送
+        if self.config.get("result_as_image", True) and self._font_path and os.path.isfile(self._font_path):
+            try:
+                png = await self._render_result_image(songs)
+                await event.send(MessageChain([Image.fromBytes(png)]))
+                self.waiting_users[event.get_session_id()] = {
+                    "key": ck, "expire": time.time() + 60,
+                    "cmd_msg_id": cmd_msg_id, "list_msg_id": None,
+                }
+                return
+            except Exception as _e:
+                logger.warning(f"初念点歌: 图片渲染失败，回退文字列表。原因: {_e!s}")
 
         list_msg_id = None
         if event.get_platform_name() == "aiocqhttp":

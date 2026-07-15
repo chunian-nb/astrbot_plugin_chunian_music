@@ -1,13 +1,62 @@
 {
-  "api_url": {"description": "网易云API地址,例如 http://172.17.0.1:3000", "type": "string", "default": "http://127.0.0.1:3000"},
-  "quality": {"description": "优先音质 lossless/exhigh/higher/standard", "type": "string", "default": "exhigh"},
-  "search_limit": {"description": "搜索返回歌曲数量", "type": "int", "default": 5},
-  "cookie": {"description": "网易云Cookie(含MUSIC_U),解锁会员音质", "type": "string", "default": ""},
-  "send_card": {"description": "QQ平台是否优先发音乐卡片", "type": "bool", "default": true},
-  "card_type": {"description": "卡片类型二选一: custom=自定义卡片(显示QQ音乐标,下面4项可自定义); 163=网易云原生卡片(显示网易云标,需NapCat配音卡签名,失败自动回退custom)", "type": "string", "default": "custom"},
-  "card_title": {"description": "[仅custom生效] 卡片标题。留空=用真实歌名,填了=用自定义", "type": "string", "default": ""},
-  "card_singer": {"description": "[仅custom生效] 卡片歌手/副标题。留空=用真实歌手,填了=用自定义", "type": "string", "default": ""},
-  "card_image": {"description": "[仅custom生效] 卡片封面图URL。留空=用真实封面,填了=用自定义图片", "type": "string", "default": ""},
-  "card_jump_url": {"description": "[仅custom生效] 点击卡片跳转地址。留空=用真实网易云歌曲页,填了=用自定义链接", "type": "string", "default": ""},
-  "recall_messages": {"description": "发卡后撤回点歌指令/列表/数字只留卡片(撤用户消息需机器人为群管理员)", "type": "bool", "default": true}
+  "api_url": {
+    "description": "网易云API地址,例如 http://172.17.0.1:3000",
+    "type": "string",
+    "default": "http://127.0.0.1:3000"
+  },
+  "quality": {
+    "description": "优先音质 lossless/exhigh/higher/standard",
+    "type": "string",
+    "default": "exhigh"
+  },
+  "search_limit": {
+    "description": "搜索返回歌曲数量",
+    "type": "int",
+    "default": 5
+  },
+  "cookie": {
+    "description": "网易云Cookie(含MUSIC_U),解锁会员音质",
+    "type": "string",
+    "default": ""
+  },
+  "send_card": {
+    "description": "QQ平台是否优先发音乐卡片",
+    "type": "bool",
+    "default": true
+  },
+  "card_type": {
+    "description": "卡片类型二选一: custom=自定义卡片(显示QQ音乐标,下面4项可自定义); 163=网易云原生卡片(显示网易云标,需NapCat配音卡签名,失败自动回退custom)",
+    "type": "string",
+    "default": "custom"
+  },
+  "card_title": {
+    "description": "[仅custom生效] 卡片标题。留空=用真实歌名,填了=用自定义",
+    "type": "string",
+    "default": ""
+  },
+  "card_singer": {
+    "description": "[仅custom生效] 卡片歌手/副标题。留空=用真实歌手,填了=用自定义",
+    "type": "string",
+    "default": ""
+  },
+  "card_image": {
+    "description": "[仅custom生效] 卡片封面图URL。留空=用真实封面,填了=用自定义图片",
+    "type": "string",
+    "default": ""
+  },
+  "card_jump_url": {
+    "description": "[仅custom生效] 点击卡片跳转地址。留空=用真实网易云歌曲页,填了=用自定义链接",
+    "type": "string",
+    "default": ""
+  },
+  "recall_messages": {
+    "description": "发卡后撤回点歌指令/列表/数字只留卡片(撤用户消息需机器人为群管理员)",
+    "type": "bool",
+    "default": true
+  },
+  "result_as_image": {
+    "description": "搜索结果以图片形式发送（白色简洁风格，含封面）。关闭则发文字列表。",
+    "type": "bool",
+    "default": true
+  }
 }
